@@ -13,11 +13,17 @@ import (
 	"github.com/minio/blake2b-simd"
 	"encoding/json"
 	"compress/gzip"
+	"crypto/sha512"
 )
 
 type BlockMap struct {
 	Version string         `json:"version"`
 	Files   []BlockMapFile `json:"files"`
+}
+
+type InputFileInfo struct {
+	Size  int64 `json:"size"`
+	Sha512 string `json:"sha512"`
 }
 
 type BlockMapFile struct {
@@ -73,7 +79,17 @@ func main() {
 		log.Fatal("-min must be >= -window")
 	}
 
-	checksums, sizes := computeBlocks(*inFile, chunkerConfiguration)
+	checksums, sizes, inputInfo := computeBlocks(*inFile, chunkerConfiguration)
+
+	serializedInputInfo, err := json.Marshal(inputInfo)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = os.Stdout.Write(serializedInputInfo)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	blockMap := BlockMap{
 		Version: "2",
@@ -94,6 +110,7 @@ func main() {
 
 	writeResult(*outFile, serializedBlockMap)
 }
+
 func writeResult(outFile string, serializedBlockMap []byte) {
 	if outFile == "" {
 		_, err := os.Stdout.Write(serializedBlockMap)
@@ -122,7 +139,7 @@ func writeResult(outFile string, serializedBlockMap []byte) {
 	}
 }
 
-func computeBlocks(inFile string, configuration ChunkerConfiguration) ([]string, []int) {
+func computeBlocks(inFile string, configuration ChunkerConfiguration) ([]string, []int, InputFileInfo) {
 	inputFileDescriptor, err := os.Open(inFile)
 	if err != nil {
 		log.Fatal(err)
@@ -132,12 +149,13 @@ func computeBlocks(inFile string, configuration ChunkerConfiguration) ([]string,
 	var checksums []string
 	var sizes []int
 
-	h, err := blake2b.New(&blake2b.Config{Size: 18})
+	chunkHash, err := blake2b.New(&blake2b.Config{Size: 18})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Chunk and write output files.
+	inputHash := sha512.New()
+
 	copyBuffer := new(bytes.Buffer)
 	r := io.TeeReader(inputFileDescriptor, copyBuffer)
 	c := rabin.NewChunker(rabin.NewTable(rabin.Poly64, configuration.Window), r, configuration.Min, configuration.Avg, configuration.Max)
@@ -149,18 +167,24 @@ func computeBlocks(inFile string, configuration ChunkerConfiguration) ([]string,
 			log.Fatal(err)
 		}
 
-		_, err = io.CopyN(h, copyBuffer, int64(copyLength))
+		rr := io.TeeReader(io.LimitReader(copyBuffer, int64(copyLength)), inputHash)
+		_, err = io.Copy(chunkHash, rr)
 		if err != nil {
 			log.Fatal("error writing hash")
 		}
 
-		checksums = append(checksums, base64.StdEncoding.EncodeToString(h.Sum(nil)))
+		checksums = append(checksums, base64.StdEncoding.EncodeToString(chunkHash.Sum(nil)))
 		sizes = append(sizes, copyLength)
 
-		h.Reset()
+		chunkHash.Reset()
 	}
 
-	return checksums, sizes
+	inputFileStat, err := inputFileDescriptor.Stat()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return checksums, sizes, InputFileInfo{inputFileStat.Size(), base64.StdEncoding.EncodeToString(inputHash.Sum(nil))}
 }
 
 // http://www.blevesearch.com/news/Deferred-Cleanup,-Checking-Errors,-and-Potential-Problems/
