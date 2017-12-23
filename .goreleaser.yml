@@ -4,9 +4,7 @@ builds:
       - darwin
       - linux
 archive:
-  format_overrides:
-    - goos: windows
-      format: zip
+  format: binary
 
 snapshot:
   name_template: SNAPSHOT
