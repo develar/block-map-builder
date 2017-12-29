@@ -14,6 +14,9 @@ import (
 	"encoding/json"
 	"compress/gzip"
 	"crypto/sha512"
+	"compress/flate"
+	"encoding/binary"
+	"hash"
 )
 
 type BlockMap struct {
@@ -22,8 +25,12 @@ type BlockMap struct {
 }
 
 type InputFileInfo struct {
-	Size  int64 `json:"size"`
+	Size   int  `json:"size"`
 	Sha512 string `json:"sha512"`
+
+	BlockMapSize *int `json:"blockMapSize,omitempty"`
+
+	hash *hash.Hash
 }
 
 type BlockMapFile struct {
@@ -31,7 +38,7 @@ type BlockMapFile struct {
 	Offset uint64 `json:"offset"`
 
 	Checksums []string `json:"checksums"`
-	Sizes     []int `json:"sizes"`
+	Sizes     []int    `json:"sizes"`
 }
 
 type ChunkerConfiguration struct {
@@ -39,6 +46,20 @@ type ChunkerConfiguration struct {
 	Avg    int
 	Min    int
 	Max    int
+}
+
+type CompressionFormat int
+
+const (
+	GZIP    = 0
+	DEFLATE = 1
+)
+
+var defaultChunkerConfiguration = ChunkerConfiguration{
+	Window: 64,
+	Avg: 16*1024,
+	Min: 8*1024,
+	Max: 32*1024,
 }
 
 func main() {
@@ -55,12 +76,25 @@ func main() {
 	inFile := flag.String("in", "", "input file")
 	outFile := flag.String("out", "", "output file")
 
+	compression := flag.String("compression", "gzip", "The compression, one of: gzip, deflate")
+	isAppend := flag.Bool("append", false, "Whether to create a new file or append to input file.")
+
 	window := FlagBytes("window", 64, "use a rolling hash with window size `w`")
 	avg := FlagBytes("avg", 16*1024, "average chunk `size`; must be a power of 2")
 	min := FlagBytes("min", 8*1024, "minimum chunk `size`")
 	max := FlagBytes("max", 32*1024, "maximum chunk `size`")
 
 	flag.Parse()
+
+	var compressionFormat CompressionFormat
+	switch *compression {
+	case "gzip":
+		compressionFormat = GZIP
+	case "deflate":
+		compressionFormat = DEFLATE
+	default:
+		log.Fatalf("Unknown compression format %s", *compression)
+	}
 
 	chunkerConfiguration := ChunkerConfiguration{
 		Window: int(*window),
@@ -79,18 +113,20 @@ func main() {
 		log.Fatal("-min must be >= -window")
 	}
 
-	checksums, sizes, inputInfo := computeBlocks(*inFile, chunkerConfiguration)
+	inputInfo := BuildBlockMap(*inFile, chunkerConfiguration, *isAppend, compressionFormat, *outFile)
 
 	serializedInputInfo, err := json.Marshal(inputInfo)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	_, err = os.Stdout.Write(serializedInputInfo)
 	if err != nil {
 		log.Fatal(err)
 	}
+}
 
+func BuildBlockMap(inFile string, chunkerConfiguration ChunkerConfiguration, isAppend bool, compressionFormat CompressionFormat, outFile string) InputFileInfo {
+	checksums, sizes, inputInfo := computeBlocks(inFile, chunkerConfiguration)
 	blockMap := BlockMap{
 		Version: "2",
 		Files: []BlockMapFile{
@@ -98,7 +134,7 @@ func main() {
 				Name:      "file",
 				Offset:    0,
 				Checksums: checksums,
-				Sizes: sizes,
+				Sizes:     sizes,
 			},
 		},
 	}
@@ -108,12 +144,51 @@ func main() {
 		log.Fatal(err)
 	}
 
-	writeResult(*outFile, serializedBlockMap)
+	if isAppend {
+		archiveSize := appendResult(serializedBlockMap, inFile, compressionFormat, inputInfo.hash)
+		inputInfo.Size += archiveSize + 4
+		inputInfo.BlockMapSize = &archiveSize
+	} else {
+		writeResult(serializedBlockMap, outFile, compressionFormat)
+	}
+
+	inputInfo.Sha512 = base64.StdEncoding.EncodeToString((*inputInfo.hash).Sum(nil))
+	return inputInfo
 }
 
-func writeResult(outFile string, serializedBlockMap []byte) {
+func appendResult(data []byte, inFile string, compressionFormat CompressionFormat, hash *hash.Hash) int {
+	archiveBuffer := new(bytes.Buffer)
+	archiveData(data, compressionFormat, archiveBuffer)
+	outFileDescriptor, err := os.OpenFile(inFile, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer Close(outFileDescriptor)
+
+	archiveSize := archiveBuffer.Len()
+	_, err = io.Copy(outFileDescriptor, io.TeeReader(archiveBuffer, *hash))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, uint32(archiveSize))
+	_, err = outFileDescriptor.Write(b)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = (*hash).Write(b)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return archiveSize
+}
+
+func writeResult(data []byte, outFile string, compressionFormat CompressionFormat) {
 	if outFile == "" {
-		_, err := os.Stdout.Write(serializedBlockMap)
+		_, err := os.Stdout.Write(data)
 		if err != nil {
 			log.Fatalf("error writing: %s", err)
 		}
@@ -121,19 +196,30 @@ func writeResult(outFile string, serializedBlockMap []byte) {
 		return
 	}
 
-	outFileFileDescriptor, err := os.Create(outFile)
+	outFileDescriptor, err := os.Create(outFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer Close(outFileFileDescriptor)
+	defer Close(outFileDescriptor)
 
-	gzipWriter, _ := gzip.NewWriterLevel(outFileFileDescriptor, gzip.BestCompression)
-	_, err = gzipWriter.Write(serializedBlockMap)
+	archiveData(data, compressionFormat, outFileDescriptor)
+}
+
+func archiveData(data []byte, compressionFormat CompressionFormat, destinationWriter io.Writer) {
+	var archiveWriter io.WriteCloser
+	var err error
+	if compressionFormat == DEFLATE {
+		archiveWriter, err = flate.NewWriter(destinationWriter, flate.BestCompression)
+	} else {
+		archiveWriter, err = gzip.NewWriterLevel(destinationWriter, gzip.BestCompression)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = gzipWriter.Close()
+	defer Close(archiveWriter)
+
+	_, err = archiveWriter.Write(data)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -184,7 +270,20 @@ func computeBlocks(inFile string, configuration ChunkerConfiguration) ([]string,
 		log.Fatal(err)
 	}
 
-	return checksums, sizes, InputFileInfo{inputFileStat.Size(), base64.StdEncoding.EncodeToString(inputHash.Sum(nil))}
+	sum := 0
+	for _, s := range sizes {
+		sum += s
+	}
+
+	fileSize := int(inputFileStat.Size())
+	if sum != fileSize {
+		log.Fatalf("Expected size sum: %d. Actual: %d", fileSize, sum)
+	}
+
+	return checksums, sizes, InputFileInfo{
+		Size: fileSize,
+		hash: &inputHash,
+	}
 }
 
 // http://www.blevesearch.com/news/Deferred-Cleanup,-Checking-Errors,-and-Potential-Problems/

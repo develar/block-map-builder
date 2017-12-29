@@ -9,23 +9,19 @@ if [ -z "$GITHUB_TOKEN" ] ; then
 fi
 
 NAME=block-map-builder
-VERSION=0.0.1
+VERSION=0.1.0
 
-checksums=""
+OUT_DIR="$BASEDIR/dist/out"
+rm -rf "$OUT_DIR"
+
 publish()
 {
   outDir=$1
   archiveName="$NAME-v$VERSION-$2"
-  archiveFile="$BASEDIR/dist/$archiveName=.7z"
-  rm -f "$archiveFile"
+  archiveFile="$OUT_DIR/$archiveName.7z"
 
   cd "$BASEDIR/dist/$outDir"
   7za a -mx=9 -mfb=64 "$archiveFile" .
-
-  CHECKSUM=$(shasum -a 512 "$archiveFile" | xxd -r -p | base64)
-  github-release develar/block-map-builder "v$VERSION" master "" "$archiveFile"
-
-  checksums="$checksums\n$archiveName $CHECKSUM"
 }
 
 publish "darwinamd64" mac
@@ -34,4 +30,4 @@ publish "linuxamd64" linux-x64
 publish "windows386" win-ia32
 publish "windowsamd64" win-x64
 
-printf "$checksums\n"
+tool-releaser develar/block-map-builder "v$VERSION" master "" "$OUT_DIR/*.7z"
