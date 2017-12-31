@@ -5,7 +5,7 @@ import (
 	"flag"
 )
 
-type Bytes int64
+type Bytes int
 
 var si = []string{"", "k", "M", "G", "T", "P", "E", "Z", "Y"}
 

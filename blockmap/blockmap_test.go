@@ -1,4 +1,4 @@
-package main
+package blockmap
 
 import (
 	"io/ioutil"
@@ -14,7 +14,7 @@ import (
 func TestAppend(t *testing.T) {
 	file, err := ioutil.TempFile("", "append")
 	if err != nil {
-		log.Fatal(err)
+		t.Error(err)
 	}
 
 	log.Print()
@@ -22,11 +22,11 @@ func TestAppend(t *testing.T) {
 	file.WriteString(strings.Repeat("hello world. ", 1024))
 	Close(file)
 
-	inputInfo := BuildBlockMap(file.Name(), defaultChunkerConfiguration, true, DEFLATE, "")
+	inputInfo, err := BuildBlockMap(file.Name(), DefaultChunkerConfiguration, DEFLATE, "")
 
 	fileData, err := ioutil.ReadFile(file.Name())
 	if err != nil {
-		log.Fatal(err)
+		t.Error(err)
 	}
 
 	hash := sha512.New()
@@ -36,7 +36,7 @@ func TestAppend(t *testing.T) {
 
 	serializedInputInfo, err := json.Marshal(inputInfo)
 	if err != nil {
-		log.Fatal(err)
+		t.Error(err)
 	}
 	assert.Equal(t, "{\"size\":13423,\"sha512\":\"zPFW3WAFUKFvAfBdNXHDIuZekSW/qf33lf5OgKXBKg9oOobwVH9X/DRHExC9087Cxkp3nqFrwtreWZHLso3D6g==\",\"blockMapSize\":107}", string(serializedInputInfo))
 }
